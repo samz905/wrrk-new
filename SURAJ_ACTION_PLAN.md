@@ -1,6 +1,6 @@
 # Suraj's Action Plan
 
-This is your guide for building 4 features. Work through them in order. 
+This is your guide for building 4 features. Work through them in order.
 
 ---
 
@@ -8,10 +8,72 @@ This is your guide for building 4 features. Work through them in order.
 
 | # | Feature | Priority |
 |---|---------|----------|
-| 1 | User & Org Management | Do first |
+| 1 | User & Org Management | Do first (includes hierarchy!) |
 | 4 | Real-time Features | Do second |
-| 6 | Email Channel | Do third |
-| 7 | Website Chat Widget | Do fourth |
+| 6 | Email Channel | Do third (AI-first!) |
+| 7 | Website Chat Widget | Do fourth (AI-first!) |
+
+---
+
+## CRITICAL: User Hierarchy
+
+**READ THIS FIRST** - The app uses hierarchical user management:
+
+```
+OWNER(s) ─────────────────────────────┐
+├── MANAGER A                         │
+│   ├── Agent 1                       │  Organization
+│   └── Agent 2                       │
+├── MANAGER B                         │
+│   └── Agent 3                       │
+└── OWNER 2 (promoted)                │
+──────────────────────────────────────┘
+```
+
+**Key Rules**:
+- Roles: `OWNER > MANAGER > AGENT` (3 roles, not 4)
+- Users only see users they created (`createdById` field)
+- OWNER sees everyone, MANAGER sees subtree, AGENT sees only self
+- When inviting, set `createdById` to the inviter's ID
+
+---
+
+## CRITICAL: AI-First Flow
+
+For Email and Chat Widget, **AI handles customers first**:
+
+```
+Customer Message → AI Tries to Resolve → Can't? → Create Ticket → Round-Robin Assign
+```
+
+See Feature 6 and 7 for implementation details.
+
+---
+
+## Schema Changes YOU Must Do
+
+Before starting, update `packages/database/prisma/schema.prisma`:
+
+```prisma
+// 1. Change Role enum (was 4 roles, now 3)
+enum Role {
+  OWNER     // Was: ADMIN
+  MANAGER   // Was: MANAGER + SUPERVISOR
+  AGENT     // Same
+}
+
+// 2. Add to User model:
+model User {
+  // ... existing fields ...
+
+  // ADD THESE:
+  createdById   String?
+  createdBy     User?    @relation("CreatedUsers", fields: [createdById], references: [id])
+  createdUsers  User[]   @relation("CreatedUsers")
+}
+```
+
+Then run: `pnpm db:push`
 
 ---
 
@@ -45,33 +107,108 @@ pnpm dev
 
 ---
 
-## Feature 1: User & Org Management
+## Feature 1: User & Org Management (WITH HIERARCHY)
 
 ### What you're building
-Users can log in, update their profile, and invite teammates.
+Users can log in, update their profile, and invite teammates. **WITH HIERARCHY** - users only see who they created.
 
 ### Files you'll work on
 ```
-apps/web/app/api/users/route.ts           # List users
+apps/web/lib/rbac/hierarchy.ts            # NEW: Hierarchy helper (create this!)
+apps/web/app/api/users/route.ts           # List users (filtered by hierarchy!)
 apps/web/app/api/users/[id]/route.ts      # Get/update single user
 apps/web/app/api/organizations/[id]/route.ts  # Org settings
 apps/web/app/api/teams/route.ts           # List/create teams
-apps/web/app/api/teams/[id]/route.ts      # Update/delete team
-apps/web/app/api/teams/[id]/members/route.ts  # Add/remove members
-apps/web/app/api/invitations/route.ts     # Send invitations
+apps/web/app/api/invitations/route.ts     # Send invitations (sets createdById!)
 ```
 
 ### Step-by-step
 
-#### Step 1.1: Make GET /api/users work
+#### Step 1.0: Create Hierarchy Helper (FIRST!)
 
-Open `apps/web/app/api/users/route.ts` and make sure it:
+Create `apps/web/lib/rbac/hierarchy.ts`:
+
+```typescript
+import { prisma } from '@wrrk/database'
+
+/**
+ * Get all user IDs in a user's subtree (themselves + all users they created, recursively)
+ * OWNER: Returns all users in org
+ * MANAGER: Returns self + users they created (recursively)
+ * AGENT: Returns only self
+ */
+export async function getSubtreeUserIds(
+  userId: string,
+  role: string,
+  organizationId: string
+): Promise<string[]> {
+  // OWNER sees everyone
+  if (role === 'OWNER') {
+    const allUsers = await prisma.user.findMany({
+      where: { organizationId },
+      select: { id: true }
+    })
+    return allUsers.map(u => u.id)
+  }
+
+  // AGENT sees only self
+  if (role === 'AGENT') {
+    return [userId]
+  }
+
+  // MANAGER sees self + their subtree
+  const result: string[] = [userId]
+
+  async function collectChildren(parentId: string) {
+    const children = await prisma.user.findMany({
+      where: { createdById: parentId },
+      select: { id: true }
+    })
+    for (const child of children) {
+      result.push(child.id)
+      await collectChildren(child.id)  // Recursively get their children
+    }
+  }
+
+  await collectChildren(userId)
+  return result
+}
+
+/**
+ * Check if user can see/manage another user
+ */
+export async function canManageUser(
+  managerId: string,
+  managerRole: string,
+  targetUserId: string,
+  organizationId: string
+): Promise<boolean> {
+  const subtree = await getSubtreeUserIds(managerId, managerRole, organizationId)
+  return subtree.includes(targetUserId)
+}
+
+/**
+ * Get the manager (createdBy) of a user
+ */
+export async function getManager(userId: string): Promise<string | null> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { createdById: true }
+  })
+  return user?.createdById || null
+}
+```
+
+#### Step 1.1: Make GET /api/users work WITH HIERARCHY
+
+Open `apps/web/app/api/users/route.ts`:
 
 ```typescript
 import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth'
 import { prisma } from '@wrrk/database'
 import { authOptions } from '@/lib/auth/config'
+import { getSubtreeUserIds } from '@/lib/rbac/hierarchy'
 
 export async function GET(req: NextRequest) {
   // 1. Check if user is logged in
@@ -86,10 +223,18 @@ export async function GET(req: NextRequest) {
   const page = parseInt(searchParams.get('page') || '1')
   const limit = parseInt(searchParams.get('limit') || '20')
 
-  // 3. Fetch users from database (only from user's organization!)
+  // 3. Get user IDs this user can see (HIERARCHY!)
+  const visibleUserIds = await getSubtreeUserIds(
+    session.user.id,
+    session.user.role,
+    session.user.organizationId
+  )
+
+  // 4. Fetch users from database (filtered by hierarchy!)
   const users = await prisma.user.findMany({
     where: {
-      organizationId: session.user.organizationId,  // IMPORTANT: Always filter by org
+      id: { in: visibleUserIds },  // HIERARCHY FILTER!
+      organizationId: session.user.organizationId,
       OR: search ? [
         { name: { contains: search, mode: 'insensitive' } },
         { email: { contains: search, mode: 'insensitive' } }
@@ -104,15 +249,24 @@ export async function GET(req: NextRequest) {
 }
 ```
 
-#### Step 1.2: Test it
+#### Step 1.2: Test it (IMPORTANT!)
+
+**Test the hierarchy by logging in as different users:**
+
+| # | Login As | Expected Result |
+|---|----------|-----------------|
+| 1 | Owner | See ALL users in org |
+| 2 | Manager M1 | See only M1 + agents M1 created |
+| 3 | Agent A1 | See only A1 (self) |
+
 ```bash
-# In browser console or Postman:
+# In browser console:
 GET http://localhost:3000/api/users
 
-# Should return list of users in your org
+# Verify: Only see users you should see!
 ```
 
-#### Step 1.3: Make PATCH /api/users/[id] work
+#### Step 1.3: Make PATCH /api/users/[id] work WITH HIERARCHY
 
 Open `apps/web/app/api/users/[id]/route.ts`:
 
@@ -121,7 +275,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth'
 import { prisma } from '@wrrk/database'
 import { authOptions } from '@/lib/auth/config'
-import { hasPermission } from '@/lib/rbac/permissions'
+import { canManageUser } from '@/lib/rbac/hierarchy'
 
 export async function PATCH(
   req: NextRequest,
@@ -136,23 +290,30 @@ export async function PATCH(
   const { name, avatar, role } = body
 
   // Users can update their own profile
-  // Only ADMIN/MANAGER can update others or change roles
   const isOwnProfile = params.id === session.user.id
-  const canUpdateOthers = hasPermission(session.user.role, 'users:update')
 
-  if (!isOwnProfile && !canUpdateOthers) {
-    return NextResponse.json({ error: 'Not allowed' }, { status: 403 })
+  // Otherwise, check hierarchy - can only update users in your subtree
+  if (!isOwnProfile) {
+    const canManage = await canManageUser(
+      session.user.id,
+      session.user.role,
+      params.id,
+      session.user.organizationId
+    )
+    if (!canManage) {
+      return NextResponse.json({ error: 'Not allowed - not in your subtree' }, { status: 403 })
+    }
   }
 
-  // Only ADMIN can change roles
-  if (role && session.user.role !== 'ADMIN') {
-    return NextResponse.json({ error: 'Only admin can change roles' }, { status: 403 })
+  // Only OWNER can change roles
+  if (role && session.user.role !== 'OWNER') {
+    return NextResponse.json({ error: 'Only owner can change roles' }, { status: 403 })
   }
 
   const updated = await prisma.user.update({
     where: {
       id: params.id,
-      organizationId: session.user.organizationId  // Security: only update users in same org
+      organizationId: session.user.organizationId
     },
     data: {
       ...(name && { name }),
@@ -165,7 +326,7 @@ export async function PATCH(
 }
 ```
 
-#### Step 1.4: Make invitations work
+#### Step 1.4: Make invitations work WITH createdById
 
 Open `apps/web/app/api/invitations/route.ts`:
 
@@ -174,7 +335,6 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth'
 import { prisma } from '@wrrk/database'
 import { authOptions } from '@/lib/auth/config'
-import { hasPermission } from '@/lib/rbac/permissions'
 import { randomBytes } from 'crypto'
 
 export async function POST(req: NextRequest) {
@@ -183,46 +343,83 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Not logged in' }, { status: 401 })
   }
 
-  // Only ADMIN/MANAGER can invite
-  if (!hasPermission(session.user.role, 'invitations:create')) {
-    return NextResponse.json({ error: 'Not allowed' }, { status: 403 })
+  // Only OWNER and MANAGER can invite
+  if (session.user.role === 'AGENT') {
+    return NextResponse.json({ error: 'Agents cannot invite' }, { status: 403 })
   }
 
   const { email, role = 'AGENT' } = await req.json()
+
+  // Validate role - can only create users at or below your level
+  if (session.user.role === 'MANAGER' && role === 'OWNER') {
+    return NextResponse.json({ error: 'Managers cannot create Owners' }, { status: 403 })
+  }
 
   // Generate secure token
   const token = randomBytes(32).toString('hex')
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
 
-  // Create invitation
+  // Create invitation - IMPORTANT: Store invitedById for hierarchy!
   const invitation = await prisma.invitation.create({
     data: {
       email,
       role,
       token,
       expiresAt,
-      invitedById: session.user.id,
+      invitedById: session.user.id,  // This becomes createdById when accepted!
       organizationId: session.user.organizationId
     }
   })
 
-  // TODO: Send email with invitation link
-  // For now, just return the token (Samarth will help with email)
   const inviteLink = `${process.env.NEXT_PUBLIC_APP_URL}/invite/${token}`
 
   return NextResponse.json({
     data: invitation,
-    inviteLink  // Remove this in production, just for testing
+    inviteLink  // Remove in production
   }, { status: 201 })
 }
 ```
 
+#### Step 1.5: Make accept invitation set createdById
+
+When user accepts invite, their `createdById` should be set to whoever invited them:
+
+```typescript
+// In POST /api/invitations/accept
+const newUser = await prisma.user.create({
+  data: {
+    email: invitation.email,
+    name: body.name,
+    role: invitation.role,
+    organizationId: invitation.organizationId,
+    createdById: invitation.invitedById  // CRITICAL: Sets hierarchy!
+  }
+})
+```
+
+### How to Test Feature 1 (User Journey Based)
+
+**Setup** (create these test users first):
+1. Create Owner (owner@test.com)
+2. Owner invites Manager M1 → M1.createdById = Owner.id
+3. M1 invites Agent A1 → A1.createdById = M1.id
+
+**Test Cases**:
+| # | Login As | Action | Expected |
+|---|----------|--------|----------|
+| 1 | Owner | GET /api/users | See all users |
+| 2 | M1 | GET /api/users | See M1 + A1 only |
+| 3 | A1 | GET /api/users | See A1 only |
+| 4 | M1 | PATCH A1's profile | Works (A1 in M1's subtree) |
+| 5 | A1 | PATCH M1's profile | **Fails** (M1 not in A1's subtree) |
+| 6 | M1 | Invite with role=OWNER | **Fails** (can't create owner) |
+| 7 | Owner | Invite with role=OWNER | Works |
+
 ### How to know Feature 1 is done
-- [ ] Can call GET /api/users and see user list
-- [ ] Can call PATCH /api/users/[id] to update profile
-- [ ] Can call POST /api/invitations to create invite
-- [ ] Frontend /settings/profile page loads and saves changes
-- [ ] Frontend /settings/team page shows team members
+- [ ] GET /api/users respects hierarchy (verified with 3 different users)
+- [ ] PATCH /api/users/[id] only works for subtree users
+- [ ] Invitations set correct createdById
+- [ ] Frontend /settings/team page shows hierarchy-filtered users
 
 ---
 
@@ -453,27 +650,37 @@ export function useTicketSubscription(ticketId: string) {
 
 ---
 
-## Feature 6: Email Channel
+## Feature 6: Email Channel (AI-FIRST!)
 
 ### What you're building
-Customers email support@yourcompany.com → ticket is created.
+Customers email support@yourcompany.com → **AI tries to respond first**.
+Only if AI can't resolve → ticket is created and assigned.
 Agent replies → customer receives email.
+
+### The AI-First Flow
+```
+Email arrives → AI Copilot tries to answer → Can't? → Create ticket → Round-robin assign
+```
 
 ### Files you'll work on
 ```
-apps/web/app/api/webhooks/email/inbound/route.ts   # Receive emails
+apps/web/app/api/webhooks/email/inbound/route.ts   # Receive emails (AI-first!)
 apps/web/lib/email/sendgrid.ts                      # Send emails
+apps/web/lib/ai/copilot.ts                          # (Sneha's) AI resolution
 ```
 
 ### Step-by-step
 
-#### Step 6.1: Create inbound webhook
+#### Step 6.1: Create inbound webhook WITH AI-FIRST
 
 Create `apps/web/app/api/webhooks/email/inbound/route.ts`:
 
 ```typescript
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@wrrk/database'
+import { tryAIResolve } from '@/lib/ai/copilot'  // Sneha creates this
+import { sendEmail } from '@/lib/email/sendgrid'
+import { getNextAvailableAgent } from '@/lib/rbac/assignment'
 
 export async function POST(req: NextRequest) {
   // SendGrid sends form data
@@ -491,7 +698,6 @@ export async function POST(req: NextRequest) {
   const senderName = from.replace(/<.+>/, '').trim() || senderEmail
 
   // Find which organization this email is for
-  // (Based on the 'to' address - you'll configure this in settings)
   const integration = await prisma.integration.findFirst({
     where: {
       type: 'EMAIL',
@@ -508,7 +714,55 @@ export async function POST(req: NextRequest) {
   }
 
   const organizationId = integration.organizationId
+  const messageContent = text || html || ''
 
+  // Check if this is a reply to existing ticket
+  const ticketMatch = subject.match(/\[#([A-Z]+-\d+)\]/)
+
+  if (ticketMatch) {
+    // Reply to existing ticket - just add message, no AI
+    const ticket = await prisma.ticket.findFirst({
+      where: { ticketNumber: ticketMatch[1], organizationId }
+    })
+
+    if (ticket) {
+      await prisma.message.create({
+        data: {
+          content: messageContent,
+          ticketId: ticket.id,
+          senderType: 'CUSTOMER'
+        }
+      })
+      return NextResponse.json({ success: true, ticketId: ticket.id })
+    }
+  }
+
+  // NEW EMAIL: Try AI resolution FIRST!
+  const aiResult = await tryAIResolve(messageContent, organizationId)
+
+  if (aiResult.resolved) {
+    // AI handled it! Send response email, no ticket created
+    await sendEmail({
+      to: senderEmail,
+      subject: `Re: ${subject}`,
+      html: aiResult.response
+    })
+
+    // Log AI resolution for analytics
+    await prisma.copilotInteraction.create({
+      data: {
+        organizationId,
+        type: 'AUTO_RESOLVE',
+        prompt: messageContent,
+        response: aiResult.response,
+        success: true
+      }
+    })
+
+    return NextResponse.json({ success: true, aiResolved: true })
+  }
+
+  // AI couldn't resolve - create ticket
   // Find or create customer
   let customer = await prisma.customer.findFirst({
     where: { email: senderEmail, organizationId }
@@ -524,65 +778,75 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  // Check if this is a reply to existing ticket
-  // Look for ticket number in subject like "Re: [#ACME-0042] Your request"
-  const ticketMatch = subject.match(/\[#([A-Z]+-\d+)\]/)
-  let ticket
+  // Generate ticket number
+  const lastTicket = await prisma.ticket.findFirst({
+    where: { organizationId },
+    orderBy: { createdAt: 'desc' }
+  })
+  const org = await prisma.organization.findUnique({ where: { id: organizationId } })
+  const prefix = org?.name?.substring(0, 4).toUpperCase() || 'TKT'
+  const nextNum = lastTicket ? parseInt(lastTicket.ticketNumber.split('-')[1]) + 1 : 1
+  const ticketNumber = `${prefix}-${nextNum.toString().padStart(4, '0')}`
 
-  if (ticketMatch) {
-    // Find existing ticket
-    ticket = await prisma.ticket.findFirst({
-      where: {
-        ticketNumber: ticketMatch[1],
-        organizationId
-      }
-    })
-  }
+  // Round-robin assign to available agent
+  const assignee = await getNextAvailableAgent(organizationId)
 
-  if (!ticket) {
-    // Create new ticket
-    const lastTicket = await prisma.ticket.findFirst({
-      where: { organizationId },
-      orderBy: { createdAt: 'desc' }
-    })
-
-    const org = await prisma.organization.findUnique({
-      where: { id: organizationId }
-    })
-    const prefix = org?.name?.substring(0, 4).toUpperCase() || 'TKT'
-    const nextNum = lastTicket
-      ? parseInt(lastTicket.ticketNumber.split('-')[1]) + 1
-      : 1
-    const ticketNumber = `${prefix}-${nextNum.toString().padStart(4, '0')}`
-
-    ticket = await prisma.ticket.create({
-      data: {
-        ticketNumber,
-        subject: subject || 'No subject',
-        status: 'OPEN',
-        priority: 'MEDIUM',
-        channel: 'EMAIL',
-        customerId: customer.id,
-        organizationId
-      }
-    })
-  }
+  // Create ticket
+  const ticket = await prisma.ticket.create({
+    data: {
+      ticketNumber,
+      subject: subject || 'No subject',
+      status: 'OPEN',
+      priority: 'MEDIUM',
+      channel: 'EMAIL',
+      customerId: customer.id,
+      assigneeId: assignee?.id,  // Auto-assigned!
+      organizationId,
+      metadata: { aiAttempted: true, aiConfidence: aiResult.confidence }
+    }
+  })
 
   // Add message to ticket
   await prisma.message.create({
     data: {
-      content: text || html || '',
+      content: messageContent,
       ticketId: ticket.id,
       senderType: 'CUSTOMER',
       customerId: customer.id
     }
   })
 
-  // Emit socket event so agents see it
-  // (Import from your socket server)
-  // emitToOrg(organizationId, 'ticket:updated', { ticketId: ticket.id })
+  return NextResponse.json({ success: true, ticketId: ticket.id, aiResolved: false })
+}
+```
 
-  return NextResponse.json({ success: true, ticketId: ticket.id })
+#### Step 6.2: Create round-robin assignment helper
+
+Create `apps/web/lib/rbac/assignment.ts`:
+
+```typescript
+import { prisma } from '@wrrk/database'
+
+// Simple round-robin: Get next available agent
+let lastAssignedIndex: Record<string, number> = {}
+
+export async function getNextAvailableAgent(organizationId: string) {
+  // Get all agents in org
+  const agents = await prisma.user.findMany({
+    where: {
+      organizationId,
+      role: 'AGENT'
+    },
+    orderBy: { createdAt: 'asc' }
+  })
+
+  if (agents.length === 0) return null
+
+  // Round-robin
+  const index = (lastAssignedIndex[organizationId] || 0) % agents.length
+  lastAssignedIndex[organizationId] = index + 1
+
+  return agents[index]
 }
 ```
 
@@ -649,25 +913,47 @@ if (ticket.channel === 'EMAIL' && senderType === 'AGENT') {
 }
 ```
 
+### How to Test Feature 6 (AI-First Email)
+
+**Test Cases**:
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Email simple question (e.g., "What are your hours?") | AI responds via email, NO ticket created |
+| 2 | Email complex question AI can't answer | Ticket created, auto-assigned to agent |
+| 3 | Agent replies to ticket | Customer receives email reply |
+| 4 | Customer replies to agent email | Message added to same ticket |
+| 5 | Check ticket metadata | Shows `aiAttempted: true` |
+
+**Browser Steps**:
+1. Send email to support@yourdomain.com with simple question
+2. Check inbox - should get AI response (no ticket in dashboard)
+3. Send another email with complex question
+4. Check dashboard - ticket should appear, assigned to an agent
+5. Reply as agent - customer should get email
+
 ### How to know Feature 6 is done
-- [ ] Send email to configured support address
-- [ ] Ticket appears in dashboard
-- [ ] Reply to ticket from dashboard
-- [ ] Customer receives email reply
-- [ ] Customer replies → message added to same ticket
+- [ ] Simple emails get AI response (no ticket)
+- [ ] Complex emails create ticket with auto-assignment
+- [ ] Agent replies send email to customer
+- [ ] Customer replies add to existing ticket
 
 ---
 
-## Feature 7: Website Chat Widget
+## Feature 7: Website Chat Widget (AI-FIRST!)
 
 ### What you're building
 A chat bubble that customers can embed on their website.
+**AI responds first**, only creates ticket if AI can't resolve.
+
+### The AI-First Flow
+```
+Customer message → AI Copilot responds → Can't resolve OR "talk to human" → Create ticket
+```
 
 ### Files you'll work on
 ```
 apps/web/app/api/widget/init/route.ts        # Widget initialization
-apps/web/app/api/widget/start-chat/route.ts  # Start new chat
-apps/web/app/api/widget/message/route.ts     # Send message
+apps/web/app/api/widget/message/route.ts     # Send message (AI-first!)
 apps/web/public/widget.js                     # The embed script
 ```
 
@@ -710,17 +996,71 @@ export async function POST(req: NextRequest) {
 }
 ```
 
-#### Step 7.2: Create start-chat endpoint
+#### Step 7.2: Create message endpoint WITH AI-FIRST
 
-Create `apps/web/app/api/widget/start-chat/route.ts`:
+Create `apps/web/app/api/widget/message/route.ts`:
 
 ```typescript
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@wrrk/database'
+import { emitToTicket } from '@/lib/socket/server'
+import { tryAIResolve } from '@/lib/ai/copilot'  // Sneha creates this
+import { getNextAvailableAgent } from '@/lib/rbac/assignment'
 
 export async function POST(req: NextRequest) {
-  const { sessionId, organizationId, customerInfo } = await req.json()
+  const { sessionId, organizationId, content, customerInfo } = await req.json()
 
+  // Check for escalation keywords
+  const wantsHuman = /talk to (human|agent|person)|speak to someone|real person/i.test(content)
+
+  // Check if there's an existing ticket for this session
+  let ticket = await prisma.ticket.findFirst({
+    where: {
+      organizationId,
+      metadata: { path: ['widgetSessionId'], equals: sessionId }
+    }
+  })
+
+  // If ticket exists, this is a follow-up message
+  if (ticket) {
+    // Add message to existing ticket
+    const message = await prisma.message.create({
+      data: {
+        content,
+        ticketId: ticket.id,
+        senderType: 'CUSTOMER'
+      }
+    })
+
+    emitToTicket(ticket.id, 'message:new', {
+      id: message.id,
+      content: message.content,
+      senderType: 'CUSTOMER',
+      createdAt: message.createdAt
+    })
+
+    return NextResponse.json({
+      messageId: message.id,
+      ticketId: ticket.id,
+      type: 'ticket_message'
+    })
+  }
+
+  // NEW CONVERSATION: Try AI first (unless they want human)
+  if (!wantsHuman) {
+    const aiResult = await tryAIResolve(content, organizationId)
+
+    if (aiResult.resolved) {
+      // AI handled it! Return response, no ticket created
+      return NextResponse.json({
+        type: 'ai_response',
+        response: aiResult.response,
+        resolved: true
+      })
+    }
+  }
+
+  // AI couldn't resolve OR customer wants human - create ticket
   // Find or create customer
   let customer = null
   if (customerInfo?.email) {
@@ -744,18 +1084,16 @@ export async function POST(req: NextRequest) {
     where: { organizationId },
     orderBy: { createdAt: 'desc' }
   })
-
-  const org = await prisma.organization.findUnique({
-    where: { id: organizationId }
-  })
+  const org = await prisma.organization.findUnique({ where: { id: organizationId } })
   const prefix = org?.name?.substring(0, 4).toUpperCase() || 'TKT'
-  const nextNum = lastTicket
-    ? parseInt(lastTicket.ticketNumber.split('-')[1]) + 1
-    : 1
+  const nextNum = lastTicket ? parseInt(lastTicket.ticketNumber.split('-')[1]) + 1 : 1
   const ticketNumber = `${prefix}-${nextNum.toString().padStart(4, '0')}`
 
+  // Round-robin assign
+  const assignee = await getNextAvailableAgent(organizationId)
+
   // Create ticket
-  const ticket = await prisma.ticket.create({
+  ticket = await prisma.ticket.create({
     data: {
       ticketNumber,
       subject: 'Chat conversation',
@@ -763,65 +1101,38 @@ export async function POST(req: NextRequest) {
       priority: 'MEDIUM',
       channel: 'CHAT',
       customerId: customer?.id,
+      assigneeId: assignee?.id,
       organizationId,
-      metadata: { widgetSessionId: sessionId }
+      metadata: { widgetSessionId: sessionId, aiAttempted: !wantsHuman }
     }
   })
 
-  return NextResponse.json({
-    ticketId: ticket.id,
-    ticketNumber: ticket.ticketNumber,
-    customerId: customer?.id
-  })
-}
-```
-
-#### Step 7.3: Create message endpoint
-
-Create `apps/web/app/api/widget/message/route.ts`:
-
-```typescript
-import { NextRequest, NextResponse } from 'next/server'
-import { prisma } from '@wrrk/database'
-import { emitToTicket } from '@/lib/socket/server'
-
-export async function POST(req: NextRequest) {
-  const { ticketId, content, sessionId } = await req.json()
-
-  // Verify ticket exists and matches session
-  const ticket = await prisma.ticket.findFirst({
-    where: {
-      id: ticketId,
-      metadata: {
-        path: ['widgetSessionId'],
-        equals: sessionId
-      }
-    }
-  })
-
-  if (!ticket) {
-    return NextResponse.json({ error: 'Ticket not found' }, { status: 404 })
-  }
-
-  // Create message
+  // Add first message
   const message = await prisma.message.create({
     data: {
       content,
-      ticketId,
+      ticketId: ticket.id,
       senderType: 'CUSTOMER',
-      customerId: ticket.customerId
+      customerId: customer?.id
     }
   })
 
-  // Emit for real-time
-  emitToTicket(ticketId, 'message:new', {
+  // Emit to agents
+  emitToTicket(ticket.id, 'message:new', {
     id: message.id,
     content: message.content,
     senderType: 'CUSTOMER',
     createdAt: message.createdAt
   })
 
-  return NextResponse.json({ messageId: message.id })
+  return NextResponse.json({
+    type: 'escalated',
+    ticketId: ticket.id,
+    ticketNumber: ticket.ticketNumber,
+    message: wantsHuman
+      ? "I'm connecting you with a support agent. Please wait..."
+      : "I'm connecting you with a support agent who can better help. Please wait..."
+  })
 }
 ```
 
@@ -1008,12 +1319,31 @@ Create `apps/web/public/widget.js`:
 })()
 ```
 
+### How to Test Feature 7 (AI-First Widget)
+
+**Test Cases**:
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Ask simple question in widget | AI responds, NO ticket created |
+| 2 | Say "talk to human" | Ticket created, assigned to agent |
+| 3 | Ask complex question AI can't answer | Ticket created, assigned to agent |
+| 4 | Agent responds in dashboard | Message appears in widget |
+| 5 | Customer sends follow-up | Message added to same ticket |
+
+**Browser Steps**:
+1. Create test HTML with widget embed
+2. Open test page, click chat bubble
+3. Ask "What are your hours?" → AI should respond
+4. Type "talk to human" → should see escalation message
+5. Check dashboard → ticket should exist with your messages
+6. Reply as agent → customer should see response in widget
+
 ### How to know Feature 7 is done
-- [ ] Create test HTML file with widget embed
-- [ ] Widget bubble appears
-- [ ] Click opens chat window
-- [ ] Send message creates ticket in dashboard
-- [ ] Agent reply appears in widget (need socket integration)
+- [ ] Widget appears on test page
+- [ ] Simple questions get AI response (no ticket)
+- [ ] "Talk to human" creates ticket
+- [ ] Complex questions create ticket
+- [ ] Agent replies appear in widget in real-time
 
 ---
 

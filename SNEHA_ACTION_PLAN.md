@@ -1,6 +1,6 @@
 # Sneha's Action Plan
 
-This is your guide for building 3 features. Work through them in order. 
+This is your guide for building 3 features. Work through them in order.
 
 ---
 
@@ -8,9 +8,48 @@ This is your guide for building 3 features. Work through them in order.
 
 | # | Feature | Priority |
 |---|---------|----------|
-| 2 | Ticketing System | Do first |
+| 2 | Ticketing System | Do first (with visibility rules!) |
 | 3 | Messaging | Do second |
-| 5 | AI Copilot | Do third |
+| 5 | AI Copilot | Do third (AI-first flow!) |
+
+---
+
+## CRITICAL: Understanding Hierarchy & Visibility
+
+**READ THIS FIRST** - Your features must respect user hierarchy:
+
+```
+OWNER(s) ─────────────────────────────┐
+├── MANAGER A                         │
+│   ├── Agent 1                       │  Organization
+│   └── Agent 2                       │
+├── MANAGER B                         │
+│   └── Agent 3                       │
+└── OWNER 2 (promoted)                │
+──────────────────────────────────────┘
+```
+
+**Ticket Visibility Rules**:
+- OWNER: Sees ALL tickets in org
+- MANAGER: Sees tickets assigned to users in their subtree
+- AGENT: Sees ONLY their assigned tickets
+
+**Assignment Rules**:
+- OWNER: Can assign to anyone
+- MANAGER: Can only assign to their subtree
+- AGENT: Cannot assign - must ESCALATE to their Manager
+
+---
+
+## CRITICAL: AI-First Flow
+
+Your AI Copilot is the **FIRST point of contact** for customers:
+
+```
+Customer Message → AI Tries to Resolve → Can't? → Create Ticket → Round-Robin Assign
+```
+
+You need to create a `tryAIResolve()` function that Suraj will call from Email and Widget.
 
 ---
 
@@ -43,14 +82,15 @@ pnpm dev
 
 ---
 
-## Feature 2: Ticketing System
+## Feature 2: Ticketing System (WITH VISIBILITY!)
 
 ### What you're building
 Agents can create, view, filter, assign, and manage support tickets.
+**WITH HIERARCHY** - users only see tickets assigned to their subtree.
 
 ### Files you'll work on
 ```
-apps/web/app/api/tickets/route.ts           # List & create tickets
+apps/web/app/api/tickets/route.ts           # List & create tickets (filtered!)
 apps/web/app/api/tickets/[id]/route.ts      # Get/update single ticket
 apps/web/app/api/customers/route.ts         # List & create customers
 apps/web/app/api/customers/[id]/route.ts    # Get/update single customer
@@ -58,7 +98,7 @@ apps/web/app/api/customers/[id]/route.ts    # Get/update single customer
 
 ### Step-by-step
 
-#### Step 2.1: Make GET /api/tickets work with filters
+#### Step 2.1: Make GET /api/tickets work WITH VISIBILITY
 
 Open `apps/web/app/api/tickets/route.ts`:
 
@@ -67,6 +107,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth'
 import { prisma } from '@wrrk/database'
 import { authOptions } from '@/lib/auth/config'
+import { getSubtreeUserIds } from '@/lib/rbac/hierarchy'  // From Suraj!
 
 export async function GET(req: NextRequest) {
   // 1. Check if user is logged in
@@ -77,28 +118,37 @@ export async function GET(req: NextRequest) {
 
   // 2. Get filter parameters from URL
   const { searchParams } = new URL(req.url)
-  const status = searchParams.get('status')           // OPEN, IN_PROGRESS, etc.
-  const priority = searchParams.get('priority')       // LOW, MEDIUM, HIGH, URGENT
-  const assigneeId = searchParams.get('assigneeId')   // Filter by assigned agent
-  const customerId = searchParams.get('customerId')   // Filter by customer
-  const search = searchParams.get('search')           // Search in subject
+  const status = searchParams.get('status')
+  const priority = searchParams.get('priority')
+  const assigneeId = searchParams.get('assigneeId')
+  const customerId = searchParams.get('customerId')
+  const search = searchParams.get('search')
   const page = parseInt(searchParams.get('page') || '1')
   const limit = parseInt(searchParams.get('limit') || '20')
 
-  // 3. Build the filter object
+  // 3. Get visible user IDs based on hierarchy (CRITICAL!)
+  const visibleUserIds = await getSubtreeUserIds(
+    session.user.id,
+    session.user.role,
+    session.user.organizationId
+  )
+
+  // 4. Build the filter object WITH VISIBILITY
   const where: any = {
-    organizationId: session.user.organizationId  // IMPORTANT: Always filter by org!
+    organizationId: session.user.organizationId,
+    // HIERARCHY FILTER: Only see tickets assigned to visible users!
+    assigneeId: { in: visibleUserIds }
   }
 
   if (status) where.status = status
   if (priority) where.priority = priority
-  if (assigneeId) where.assigneeId = assigneeId
+  if (assigneeId) where.assigneeId = assigneeId  // Additional filter within visible
   if (customerId) where.customerId = customerId
   if (search) {
     where.subject = { contains: search, mode: 'insensitive' }
   }
 
-  // 4. Fetch tickets with related data
+  // 5. Fetch tickets with related data
   const [tickets, total] = await Promise.all([
     prisma.ticket.findMany({
       where,
@@ -108,19 +158,14 @@ export async function GET(req: NextRequest) {
       },
       skip: (page - 1) * limit,
       take: limit,
-      orderBy: { updatedAt: 'desc' }  // Most recently updated first
+      orderBy: { updatedAt: 'desc' }
     }),
     prisma.ticket.count({ where })
   ])
 
   return NextResponse.json({
     data: tickets,
-    pagination: {
-      page,
-      limit,
-      total,
-      totalPages: Math.ceil(total / limit)
-    }
+    pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
   })
 }
 ```
@@ -263,11 +308,13 @@ export async function GET(
 }
 ```
 
-#### Step 2.5: Make PATCH /api/tickets/[id] work (update ticket)
+#### Step 2.5: Make PATCH /api/tickets/[id] work WITH ASSIGNMENT RULES
 
 Add to the same file:
 
 ```typescript
+import { getSubtreeUserIds, getManager } from '@/lib/rbac/hierarchy'
+
 export async function PATCH(
   req: NextRequest,
   { params }: { params: { id: string } }
@@ -278,18 +325,55 @@ export async function PATCH(
   }
 
   const body = await req.json()
-  const { status, priority, assigneeId, subject } = body
+  const { status, priority, assigneeId, subject, escalate } = body
 
-  // First check ticket exists and belongs to org
+  // First check ticket exists and user can see it
+  const visibleUserIds = await getSubtreeUserIds(
+    session.user.id,
+    session.user.role,
+    session.user.organizationId
+  )
+
   const existingTicket = await prisma.ticket.findFirst({
     where: {
       id: params.id,
-      organizationId: session.user.organizationId
+      organizationId: session.user.organizationId,
+      assigneeId: { in: visibleUserIds }  // Must be visible to user!
     }
   })
 
   if (!existingTicket) {
-    return NextResponse.json({ error: 'Ticket not found' }, { status: 404 })
+    return NextResponse.json({ error: 'Ticket not found or not visible' }, { status: 404 })
+  }
+
+  // ASSIGNMENT RULES
+  if (assigneeId) {
+    // AGENT cannot assign - must escalate
+    if (session.user.role === 'AGENT') {
+      return NextResponse.json({
+        error: 'Agents cannot assign tickets. Use escalate instead.'
+      }, { status: 403 })
+    }
+
+    // MANAGER can only assign to their subtree
+    if (session.user.role === 'MANAGER') {
+      if (!visibleUserIds.includes(assigneeId)) {
+        return NextResponse.json({
+          error: 'Can only assign to users in your team'
+        }, { status: 403 })
+      }
+    }
+    // OWNER can assign to anyone (no check needed)
+  }
+
+  // ESCALATION: Agent wants to escalate to manager
+  let newAssigneeId = assigneeId
+  if (escalate && session.user.role === 'AGENT') {
+    const managerId = await getManager(session.user.id)
+    if (!managerId) {
+      return NextResponse.json({ error: 'No manager found' }, { status: 400 })
+    }
+    newAssigneeId = managerId
   }
 
   // Update the ticket
@@ -298,32 +382,26 @@ export async function PATCH(
     data: {
       ...(status && { status }),
       ...(priority && { priority }),
-      ...(assigneeId !== undefined && { assigneeId }),
+      ...(newAssigneeId !== undefined && { assigneeId: newAssigneeId }),
       ...(subject && { subject }),
       updatedAt: new Date()
     },
-    include: {
-      customer: true,
-      assignee: true
-    }
+    include: { customer: true, assignee: true }
   })
 
   // Create audit log
   await prisma.auditLog.create({
     data: {
-      action: 'TICKET_UPDATED',
+      action: escalate ? 'TICKET_ESCALATED' : 'TICKET_UPDATED',
       entityType: 'TICKET',
       entityId: ticket.id,
       userId: session.user.id,
       organizationId: session.user.organizationId,
-      metadata: {
-        changes: { status, priority, assigneeId }
-      }
+      metadata: { changes: { status, priority, assigneeId: newAssigneeId, escalate } }
     }
   })
 
-  // Emit socket event for real-time updates (Suraj's feature)
-  // Import this from Suraj's socket server:
+  // Emit socket event (Suraj's feature)
   // emitToTicket(ticket.id, 'ticket:updated', ticket)
 
   return NextResponse.json({ data: ticket })
@@ -416,16 +494,39 @@ export async function POST(req: NextRequest) {
 }
 ```
 
+### How to Test Feature 2 (Visibility + Assignment)
+
+**Setup** (work with Suraj to create these):
+1. Owner creates Manager M1
+2. M1 creates Agent A1, A2
+3. Owner creates Manager M2
+4. M2 creates Agent A3
+5. Create tickets assigned to A1, A2, A3
+
+**Test Cases**:
+| # | Login As | Action | Expected |
+|---|----------|--------|----------|
+| 1 | Owner | GET /api/tickets | See ALL tickets |
+| 2 | M1 | GET /api/tickets | See only A1 and A2's tickets |
+| 3 | A1 | GET /api/tickets | See only A1's tickets |
+| 4 | A1 | Assign ticket to A2 | **FAIL** - Agents can't assign |
+| 5 | A1 | Escalate ticket | Works - goes to M1 |
+| 6 | M1 | Assign ticket to A1 | Works |
+| 7 | M1 | Assign ticket to A3 | **FAIL** - A3 not in M1's subtree |
+
+**Browser Steps**:
+1. Login as Owner → Go to /tickets → See all tickets
+2. Logout, login as Agent A1
+3. Go to /tickets → Should only see A1's assigned tickets
+4. Try to assign ticket → Should only see "Escalate" option
+5. Click Escalate → Ticket goes to Manager
+
 ### How to know Feature 2 is done
-- [ ] GET /api/tickets returns list of tickets
-- [ ] Can filter tickets by status, priority, assignee
-- [ ] POST /api/tickets creates ticket with auto-generated number
-- [ ] GET /api/tickets/[id] returns ticket with messages
-- [ ] PATCH /api/tickets/[id] updates status/priority/assignee
-- [ ] GET /api/customers returns customer list
-- [ ] POST /api/customers creates new customer
-- [ ] Frontend /tickets page shows tickets
-- [ ] Frontend /tickets/[id] page shows ticket details
+- [ ] Ticket list respects hierarchy (verified with 3 different users)
+- [ ] Agents can only escalate, not assign
+- [ ] Managers can only assign within subtree
+- [ ] Owners can assign to anyone
+- [ ] Filters work within visible tickets
 
 ---
 
@@ -674,16 +775,37 @@ Content-Type: application/json
 
 ---
 
-## Feature 5: AI Copilot
+## Feature 5: AI Copilot (AI-FIRST!)
 
 ### What you're building
-AI helps agents by suggesting responses and analyzing customer sentiment.
+AI is the **FIRST point of contact** for customers!
+Also helps agents by suggesting responses and analyzing sentiment.
+
+### The AI-First Flow
+```
+Customer Message (Widget/Email)
+         │
+         ▼
+   ┌───────────────┐
+   │ tryAIResolve()│ ◄── YOU CREATE THIS
+   └───────┬───────┘
+           │
+      Can resolve?
+      ┌────┴────┐
+     YES       NO
+      │         │
+      ▼         ▼
+   Return    Return
+   response  { resolved: false }
+   (no ticket)  (Suraj creates ticket)
+```
 
 ### Files you'll work on
 ```
-apps/web/lib/ai/copilot.ts                    # AI functions
-apps/web/app/api/copilot/suggest/route.ts     # Suggest response endpoint
-apps/web/app/api/copilot/categorize/route.ts  # Categorize ticket endpoint
+apps/web/lib/ai/copilot.ts                    # AI functions (including tryAIResolve!)
+apps/web/app/api/copilot/suggest/route.ts     # Suggest response for agents
+apps/web/app/api/copilot/resolve/route.ts     # AI auto-resolve for customers
+apps/web/app/api/copilot/categorize/route.ts  # Categorize ticket
 ```
 
 ### Step-by-step
@@ -796,6 +918,64 @@ ${messages.join('\n\n')}
 Provide a brief summary of the issue and current status.`
 
   return callClaude(prompt)
+}
+
+// ============================================
+// AI-FIRST: Try to resolve customer query automatically
+// Suraj calls this from Widget and Email endpoints!
+// ============================================
+export async function tryAIResolve(
+  customerMessage: string,
+  organizationId: string
+): Promise<{
+  resolved: boolean
+  response?: string
+  confidence: number
+}> {
+  // Get knowledge base or FAQs for this org (if available)
+  const knowledgeBase = await prisma.knowledgeArticle?.findMany({
+    where: { organizationId },
+    take: 10
+  }).catch(() => [])  // Ignore if table doesn't exist
+
+  const kbContext = knowledgeBase.length > 0
+    ? `\nKnowledge Base:\n${knowledgeBase.map(a => `- ${a.title}: ${a.content}`).join('\n')}`
+    : ''
+
+  const prompt = `You are an AI support assistant. A customer has sent a message.
+${kbContext}
+
+Customer message: "${customerMessage}"
+
+Can you fully answer this question? If yes, provide a helpful response.
+If no (question is too complex, needs human, or you're unsure), say you cannot.
+
+Reply with JSON only:
+{
+  "canResolve": true/false,
+  "confidence": 0.0-1.0,
+  "response": "your response if canResolve is true"
+}
+
+Important:
+- Only resolve simple, common questions you're confident about
+- If customer asks for human/agent/person, set canResolve to false
+- If question requires account lookup, set canResolve to false
+- Be helpful but honest about limitations`
+
+  try {
+    const result = await callClaude(prompt)
+    const parsed = JSON.parse(result)
+
+    return {
+      resolved: parsed.canResolve && parsed.confidence > 0.7,
+      response: parsed.response,
+      confidence: parsed.confidence
+    }
+  } catch (error) {
+    console.error('AI resolve error:', error)
+    return { resolved: false, confidence: 0 }
+  }
 }
 ```
 
@@ -1014,43 +1194,89 @@ Content-Type: application/json
 # Should return { "category": "...", "confidence": 0.8 }
 ```
 
+### How to Test Feature 5 (AI-First + Copilot)
+
+**Test AI-First (with Suraj)**:
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Widget: "What are your hours?" | AI responds, no ticket |
+| 2 | Widget: "Talk to a human" | Ticket created, no AI response |
+| 3 | Widget: Complex question | AI can't resolve → ticket created |
+| 4 | Email: Simple FAQ | AI responds via email |
+| 5 | Email: Complex issue | Ticket created |
+
+**Test Agent Copilot**:
+| # | Test | Expected |
+|---|------|----------|
+| 1 | Click "Suggest Response" on ticket | AI drafts response |
+| 2 | Edit and send suggestion | Message sent with edits |
+| 3 | New customer message arrives | Sentiment badge appears |
+| 4 | Call categorize on new ticket | Category returned |
+
+**Browser Steps**:
+1. Create a ticket with a customer message
+2. Go to ticket view
+3. Click "Suggest Response" button
+4. Verify AI suggestion appears
+5. Edit the suggestion
+6. Click Send → message should be sent
+7. Check customer message → sentiment badge should show
+
 ### How to know Feature 5 is done
-- [ ] POST /api/copilot/suggest returns AI response suggestion
-- [ ] POST /api/copilot/categorize returns category prediction
-- [ ] Sentiment analysis runs on new customer messages
-- [ ] Frontend has "Suggest Response" button that works
-- [ ] Agent can edit and send AI suggestion
-- [ ] Sentiment badge shows on customer messages
+- [ ] `tryAIResolve()` works (Suraj tests via widget/email)
+- [ ] Simple questions get AI response, complex create tickets
+- [ ] "Suggest Response" generates reply for agents
+- [ ] Sentiment analysis works on customer messages
+- [ ] Auto-categorization works on new tickets
 
 ---
 
 ## Connecting with Suraj's Features
 
-Your features depend on some of Suraj's work:
+Your features connect with Suraj's work in several places:
 
-### Real-time messages
+### 1. Suraj imports YOUR `tryAIResolve()` function
+Suraj's email webhook and widget will call your function:
+```typescript
+// In Suraj's code (email/widget):
+import { tryAIResolve } from '@/lib/ai/copilot'  // YOUR function!
+
+const result = await tryAIResolve(message, organizationId)
+if (result.resolved) {
+  // AI handled it, no ticket created
+} else {
+  // Create ticket...
+}
+```
+**Coordinate with Suraj**: Make sure your `tryAIResolve()` function is exported!
+
+### 2. You import Suraj's hierarchy helper
+For ticket visibility filtering:
+```typescript
+// In your tickets API:
+import { getSubtreeUserIds, getManager } from '@/lib/rbac/hierarchy'  // Suraj creates this!
+```
+**Coordinate with Suraj**: Make sure he creates this helper first!
+
+### 3. Real-time messages
 When you create a message, emit a socket event:
 ```typescript
-// Import from Suraj's socket server
-import { emitToTicket } from '@/lib/socket/server'
+import { emitToTicket } from '@/lib/socket/server'  // Suraj's
 
-// After creating message:
 emitToTicket(ticketId, 'message:new', messageData)
 ```
 
-### Email replies
+### 4. Email replies
 When agent replies to an EMAIL channel ticket:
 ```typescript
-// Import from Suraj's email module
-import { sendTicketReply } from '@/lib/email/sendgrid'
+import { sendTicketReply } from '@/lib/email/sendgrid'  // Suraj's
 
-// After creating message, if ticket channel is EMAIL:
 if (ticket.channel === 'EMAIL') {
   await sendTicketReply(ticket, message, ticket.customer)
 }
 ```
 
-Talk to Suraj when you need these integrations!
+**Talk to Suraj when you need these integrations!**
 
 ---
 
